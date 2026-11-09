@@ -1,0 +1,31 @@
+name: Quality checks
+
+on:
+  pull_request:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install tmux
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y tmux
+          tmux -V
+      - name: Run required checks
+        run: sh scripts/check-ci.sh
+
+  release-gate:
+    if: github.event_name == 'workflow_dispatch'
+    needs: checks
+    runs-on: ubuntu-latest
+    environment: release
+    steps:
+      - name: Confirm required checks passed
+        run: echo "Required checks passed; protected release environment reached."
