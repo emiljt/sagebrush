@@ -136,22 +136,40 @@ pub struct SessionSnapshot {
 
 impl SessionSnapshot {
     pub fn new(
+        sessions: Vec<Session>,
+        captured_at: SystemTime,
+        context: InvokingContext,
+    ) -> Result<Self, String> {
+        Self::new_checked(sessions, captured_at, context, || Ok(()))
+    }
+
+    pub(crate) fn new_checked<E: From<String>>(
         mut sessions: Vec<Session>,
         captured_at: SystemTime,
         mut context: InvokingContext,
-    ) -> Result<Self, String> {
-        if let InvokingContext::InsideTmux { session_id } = &context
-            && !sessions.iter().any(|session| &session.id == session_id)
-        {
-            context = InvokingContext::ActiveUnavailable;
+        mut check: impl FnMut() -> Result<(), E>,
+    ) -> Result<Self, E> {
+        check()?;
+        if let InvokingContext::InsideTmux { session_id } = &context {
+            let mut found = false;
+            for session in &sessions {
+                check()?;
+                if &session.id == session_id {
+                    found = true;
+                    break;
+                }
+            }
+            if !found {
+                context = InvokingContext::ActiveUnavailable;
+            }
         }
         let mut ids = HashSet::new();
         for session in &mut sessions {
+            check()?;
             if !ids.insert(session.id.clone()) {
-                return Err(format!(
-                    "duplicate tmux session identity: {}",
-                    session.id.as_str()
-                ));
+                return Err(
+                    format!("duplicate tmux session identity: {}", session.id.as_str()).into(),
+                );
             }
             validate_positive(&mut session.window_count, "windows");
             if let Field::Known(window) = &mut session.current_window {
@@ -180,8 +198,10 @@ impl SessionSnapshot {
             };
         }
         sessions.sort_by(|left, right| left.id.cmp(&right.id));
+        check()?;
         let mut issues = Vec::new();
         for session in &sessions {
+            check()?;
             collect_issue(&mut issues, &session.id, &session.name);
             collect_issue(&mut issues, &session.id, &session.window_count);
             collect_issue(&mut issues, &session.id, &session.created_at);
@@ -203,6 +223,7 @@ impl SessionSnapshot {
                 );
             }
         }
+        check()?;
         Ok(Self {
             sessions,
             captured_at,

@@ -120,3 +120,50 @@ fn undersized_and_zero_areas_are_safe_and_recover() {
     assert!(rows[2].contains("project"));
     assert_eq!(state.focus.as_ref().unwrap().as_str(), "$1");
 }
+
+#[test]
+fn long_initial_error_and_recovery_remain_readable_at_minimum_width() {
+    let now = Instant::now();
+    let mut state = AppState::new(now);
+    let error = format!(
+        "{} PERMISSION-DENIED; {} UPGRADE-TMUX",
+        "context ".repeat(10),
+        "recovery ".repeat(8)
+    );
+    assert!(state.begin_due_request(now));
+    state.finish_request(now, Err(error.clone()));
+    let mut saw_cause = false;
+    let mut saw_recovery = false;
+    for second in 0..250 {
+        let current = now + Duration::from_secs(second);
+        if second > 0 && second % 5 == 0 {
+            assert!(state.begin_due_request(current));
+            state.finish_request(current, Err(error.clone()));
+        }
+        let rows = render(&mut state, 40, 10, current);
+        saw_cause |= rows[7].contains("PERMISSION-DENIED");
+        saw_recovery |= rows[7].contains("UPGRADE-TMUX");
+    }
+    assert!(saw_cause && saw_recovery);
+}
+
+#[test]
+fn all_partial_diagnostics_remain_readable_across_refreshes() {
+    let now = Instant::now();
+    let mut state = build_state("project", now);
+    let mut snapshot = state.snapshot.as_ref().unwrap().clone();
+    snapshot.sessions[0].window_count = Field::Unavailable("FIRST-ISSUE".into());
+    snapshot.sessions[0].created_at = Field::Unavailable("SECOND-ISSUE".into());
+    let snapshot =
+        SessionSnapshot::new(snapshot.sessions, UNIX_EPOCH, InvokingContext::OutsideTmux).unwrap();
+    let mut seen = [false; 2];
+    for second in 1..180 {
+        let current = now + Duration::from_secs(second);
+        assert!(state.begin_due_request(current));
+        state.finish_request(current, Ok(snapshot.clone()));
+        let rows = render(&mut state, 40, 10, current);
+        seen[0] |= rows[7].contains("FIRST-ISSUE");
+        seen[1] |= rows[7].contains("SECOND-ISSUE");
+    }
+    assert!(seen.into_iter().all(|seen| seen));
+}

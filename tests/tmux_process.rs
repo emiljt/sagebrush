@@ -27,6 +27,23 @@ fn versions_require_final_3_3_or_later() {
 }
 
 #[test]
+fn recognizable_prereleases_are_reported_as_unsupported_with_upgrade_advice() {
+    for (version, component) in [
+        ("3.3-rc1", "client"),
+        ("3.3rc", "server"),
+        ("3.3-beta2", "client"),
+        ("3.3-dev", "server"),
+    ] {
+        let error = verify_version(version, component).unwrap_err();
+        assert!(error.contains(component), "{error}");
+        assert!(error.contains("unsupported"), "{error}");
+        assert!(error.to_lowercase().contains("upgrade"), "{error}");
+    }
+    let error = verify_version("not a version", "server").unwrap_err();
+    assert!(error.contains("cannot verify"), "{error}");
+}
+
+#[test]
 fn process_reads_both_pipes_without_truncating() {
     let fixture =
         ProcessFixture::new("#!/bin/sh\nhead -c 131072 /dev/zero\nhead -c 131072 /dev/zero >&2\n")

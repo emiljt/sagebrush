@@ -73,6 +73,9 @@ pub fn render(frame: &mut Frame<'_>, state: &mut AppState, now: Instant, color: 
         LoadState::Loading => "Loading sessions...",
         LoadState::Fresh => "Sessions",
         LoadState::Partial => "Sessions - partial",
+        LoadState::Refreshing if state.last_error.is_some() && state.snapshot.is_some() => {
+            "Refreshing sessions - stale"
+        }
         LoadState::Refreshing => "Refreshing sessions...",
         LoadState::Failed(_) => "Failed to load sessions",
         LoadState::Stale(_) => "Sessions - stale",
@@ -129,39 +132,58 @@ pub fn render(frame: &mut Frame<'_>, state: &mut AppState, now: Instant, color: 
     }
     let diagnostic = if let Some(error) = &state.last_error {
         let label = if state.snapshot.is_some() {
-            "stale"
+            "stale: "
         } else {
-            "Error"
+            "Error: "
         };
-        Some(format!(
-            "{label}: {}. Check tmux; retrying automatically.",
-            escape_text(error)
+        Some((
+            label,
+            format!(
+                "{}. Check tmux; retrying automatically.",
+                escape_text(error)
+            ),
         ))
     } else if state.partial_warning() {
-        let issue = state
-            .snapshot
-            .as_ref()
-            .and_then(|snapshot| snapshot.issues.first());
-        Some(match issue {
-            Some(issue) => format!(
-                "partial: {} - {}. {}",
-                escape_text(&issue.field),
-                escape_text(&issue.message),
-                issue
-                    .recovery
-                    .as_deref()
-                    .map(escape_text)
-                    .unwrap_or_else(|| "Check tmux and retry.".into())
-            ),
-            None => {
-                "partial: previous details remain visible until the crawl completes.".to_owned()
-            }
-        })
+        let issues = state.snapshot.as_ref().map(|snapshot| &snapshot.issues);
+        let text = match issues {
+            Some(issues) if !issues.is_empty() => issues
+                .iter()
+                .map(|issue| {
+                    format!(
+                        "{}: {} - {}. {}",
+                        issue
+                            .session_id
+                            .as_ref()
+                            .map(|id| id.as_str())
+                            .unwrap_or("session"),
+                        escape_text(&issue.field),
+                        escape_text(&issue.message),
+                        issue
+                            .recovery
+                            .as_deref()
+                            .map(escape_text)
+                            .unwrap_or_else(|| "Check tmux and retry.".into())
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("  |  "),
+            _ => "Previous details remain visible until the crawl completes.".to_owned(),
+        };
+        Some(("partial: ", text))
     } else {
         None
     };
-    if let Some(diagnostic) = diagnostic {
-        line(frame, area, area.height - 3, &diagnostic, Style::default());
+    if let Some((label, diagnostic)) = diagnostic {
+        let available = usize::from(area.width).saturating_sub(label.len());
+        let offset = state.diagnostic_offset(now, &diagnostic, available);
+        let visible = clip_cells(&diagnostic, offset, available);
+        line(
+            frame,
+            area,
+            area.height - 3,
+            &format!("{label}{visible}"),
+            Style::default(),
+        );
     }
     line(
         frame,

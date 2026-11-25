@@ -21,6 +21,7 @@ pub const HELP_LINES: &[&str] = &[
     "Sessions refresh automatically. Failed requests retry after five seconds.",
     "The selected session's complete details crawl across the screen.",
     "The crawl moves one cell per second and repeats automatically.",
+    "Long error and partial-data diagnostics also scroll automatically.",
     "A partial-data warning means one or more values are unavailable.",
     "For an error, check tmux and the selected server, then wait for retry.",
     "A terminal of at least 40 columns by 10 rows is recommended.",
@@ -60,6 +61,7 @@ pub struct AppState {
     in_flight: bool,
     next_request: Instant,
     crawl: Option<CrawlPass>,
+    diagnostic_started: Instant,
 }
 
 impl AppState {
@@ -76,6 +78,7 @@ impl AppState {
             in_flight: false,
             next_request: now,
             crawl: None,
+            diagnostic_started: now,
         }
     }
 
@@ -97,6 +100,11 @@ impl AppState {
         self.in_flight = false;
         match result {
             Ok(snapshot) => {
+                if self.last_error.is_some()
+                    || self.snapshot.as_ref().map(|old| &old.issues) != Some(&snapshot.issues)
+                {
+                    self.diagnostic_started = now;
+                }
                 self.last_error = None;
                 if self.next_request <= now {
                     let missed = now.duration_since(self.next_request).as_secs() + 1;
@@ -116,6 +124,9 @@ impl AppState {
                 self.keep_focus_visible();
             }
             Err(error) => {
+                if self.last_error.as_deref() != Some(error.as_str()) {
+                    self.diagnostic_started = now;
+                }
                 self.next_request = now + Duration::from_secs(5);
                 self.last_error = Some(error.clone());
                 self.load_state = if self.snapshot.is_some() {
@@ -185,6 +196,17 @@ impl AppState {
             .as_ref()
             .map(|crawl| now.saturating_duration_since(crawl.started).as_secs() as usize)
             .unwrap_or(0)
+    }
+
+    pub fn diagnostic_offset(&self, now: Instant, text: &str, width: usize) -> usize {
+        let cells = UnicodeWidthStr::width(text);
+        if cells <= width || cells == 0 {
+            0
+        } else {
+            (now.saturating_duration_since(self.diagnostic_started)
+                .as_secs() as usize)
+                % cells
+        }
     }
 
     pub fn advance_crawl(&mut self, now: Instant) {

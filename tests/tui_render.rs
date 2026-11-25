@@ -198,6 +198,33 @@ fn unavailable_active_status_and_initial_error_are_visible() {
 }
 
 #[test]
+fn long_stale_diagnostics_scroll_while_navigation_remains_available() {
+    let now = Instant::now();
+    let mut state = AppState::new(now);
+    assert!(state.begin_due_request(now));
+    state.finish_request(now, Ok(snapshot(false)));
+    let failure = now + std::time::Duration::from_secs(1);
+    assert!(state.begin_due_request(failure));
+    state.finish_request(
+        failure,
+        Err(format!("{} RECOVERY-STEP", "long-error ".repeat(20))),
+    );
+    state.handle_key(crossterm::event::KeyCode::Char('j'), failure);
+    assert_eq!(state.focus.as_ref().unwrap().as_str(), "$2");
+    state.handle_key(crossterm::event::KeyCode::Char('?'), failure);
+    assert!(draw(&mut state, failure).contains("Help"));
+    state.handle_key(crossterm::event::KeyCode::Esc, failure);
+    let mut saw_recovery = false;
+    for second in 0..220 {
+        let rendered = draw(&mut state, failure + std::time::Duration::from_secs(second));
+        assert!(rendered.contains("stale"), "{rendered}");
+        saw_recovery |= rendered.contains("RECOVERY-STEP");
+    }
+    assert!(saw_recovery);
+    assert!(state.handle_key(crossterm::event::KeyCode::Char('q'), failure));
+}
+
+#[test]
 fn crawl_advances_by_one_cell_and_survives_refresh() {
     let now = Instant::now();
     let mut state = AppState::new(now);

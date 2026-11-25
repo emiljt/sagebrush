@@ -53,10 +53,19 @@ pub fn verify_version(value: &str, component: &str) -> Result<(), String> {
     };
     let minor_digits = minor.bytes().take_while(u8::is_ascii_digit).count();
     let (minor, suffix) = minor.split_at(minor_digits);
+    let prerelease_suffix = suffix.strip_prefix('-').unwrap_or(suffix);
+    let prerelease = ["rc", "alpha", "beta", "pre", "preview", "dev"]
+        .iter()
+        .any(|prefix| {
+            prerelease_suffix
+                .strip_prefix(prefix)
+                .is_some_and(|number| number.bytes().all(|byte| byte.is_ascii_digit()))
+        });
     if major.is_empty()
         || !major.bytes().all(|byte| byte.is_ascii_digit())
         || minor.is_empty()
-        || !(suffix.is_empty()
+        || !(prerelease
+            || suffix.is_empty()
             || (suffix.len() == 1 && suffix.bytes().all(|byte| byte.is_ascii_lowercase())))
     {
         return Err(format!("cannot verify tmux {component} version"));
@@ -65,8 +74,10 @@ pub fn verify_version(value: &str, component: &str) -> Result<(), String> {
         .parse::<u64>()
         .and_then(|major| minor.parse::<u64>().map(|minor| (major, minor)))
         .map_err(|_| format!("cannot verify tmux {component} version"))?;
-    if version < (3, 3) {
-        return Err(format!("tmux {component} must be version 3.3 or later"));
+    if prerelease || version < (3, 3) {
+        return Err(format!(
+            "unsupported tmux {component} version; upgrade to tmux 3.3 or later"
+        ));
     }
     Ok(())
 }
@@ -260,6 +271,22 @@ impl From<ProcessError> for AcquireError {
     }
 }
 
+impl From<String> for AcquireError {
+    fn from(error: String) -> Self {
+        Self::Invalid(error)
+    }
+}
+
+fn check_request(deadline: Instant, cancelled: &AtomicBool) -> Result<(), ProcessError> {
+    if cancelled.load(Ordering::SeqCst) {
+        Err(ProcessError::Cancelled)
+    } else if Instant::now() >= deadline {
+        Err(ProcessError::Timeout)
+    } else {
+        Ok(())
+    }
+}
+
 pub struct TmuxClient {
     executable: OsString,
     context: Option<OsString>,
@@ -325,17 +352,18 @@ impl TmuxClient {
             cancelled,
         )?;
         if !probe.status.success() && socket.is_none() && absent_server(&probe.stderr) {
-            return SessionSnapshot::new(
+            return finish_snapshot(
                 Vec::new(),
-                SystemTime::now(),
                 InvokingContext::OutsideTmux,
-            )
-            .map_err(AcquireError::Invalid);
+                deadline,
+                cancelled,
+            );
         }
         let version = successful_line(&probe, "server version")?;
         verify_version(version, "server").map_err(AcquireError::Invalid)?;
 
         loop {
+            check_request(deadline, cancelled)?;
             let rows = self.list(socket.as_deref(), deadline, cancelled)?;
             let mut sessions = Vec::new();
             sessions
@@ -343,6 +371,7 @@ impl TmuxClient {
                 .map_err(|_| ProcessError::ResourceExhaustion)?;
             let mut retry = false;
             for mut session in rows {
+                check_request(deadline, cancelled)?;
                 let name = self.request(
                     socket.as_deref(),
                     &[
@@ -357,7 +386,16 @@ impl TmuxClient {
                 )?;
                 if !name.status.success() {
                     let current = self.list(socket.as_deref(), deadline, cancelled)?;
-                    if !current.iter().any(|row| row.id == session.id) {
+                    check_request(deadline, cancelled)?;
+                    let mut still_exists = false;
+                    for row in &current {
+                        check_request(deadline, cancelled)?;
+                        if row.id == session.id {
+                            still_exists = true;
+                            break;
+                        }
+                    }
+                    if !still_exists {
                         retry = true;
                         break;
                     }
@@ -383,20 +421,25 @@ impl TmuxClient {
                 continue;
             }
             let current = self.list(socket.as_deref(), deadline, cancelled)?;
-            if sessions.len() != current.len()
-                || sessions
-                    .iter()
-                    .zip(&current)
-                    .any(|(before, after)| before.id != after.id)
-            {
+            if sessions.len() != current.len() {
+                continue;
+            }
+            let mut matching_ids = true;
+            for (before, after) in sessions.iter().zip(&current) {
+                check_request(deadline, cancelled)?;
+                if before.id != after.id {
+                    matching_ids = false;
+                    break;
+                }
+            }
+            if !matching_ids {
                 continue;
             }
             let context = match socket.as_deref() {
                 Some(socket) => self.invoking_context(socket, deadline, cancelled)?,
                 None => InvokingContext::OutsideTmux,
             };
-            return SessionSnapshot::new(sessions, SystemTime::now(), context)
-                .map_err(AcquireError::Invalid);
+            return finish_snapshot(sessions, context, deadline, cancelled);
         }
     }
 
@@ -425,7 +468,7 @@ impl TmuxClient {
         if !clients.status.success() {
             return Ok(InvokingContext::ActiveUnavailable);
         }
-        Ok(parse_client_context(&clients.stdout, &tty))
+        parse_client_context(&clients.stdout, &tty, deadline, cancelled)
     }
 
     fn list(
@@ -450,94 +493,125 @@ impl TmuxClient {
             }
             return Err(command_error("session list", &output.stderr));
         }
-        let text = std::str::from_utf8(&output.stdout)
-            .map_err(|_| AcquireError::Invalid("invalid tmux metadata encoding".to_owned()))?;
-        if !text.is_empty() && !text.ends_with('\n') {
+        parse_sessions(&output.stdout, socket.is_some(), deadline, cancelled)
+    }
+}
+
+fn finish_snapshot(
+    sessions: Vec<Session>,
+    context: InvokingContext,
+    deadline: Instant,
+    cancelled: &AtomicBool,
+) -> Result<SessionSnapshot, AcquireError> {
+    SessionSnapshot::new_checked(sessions, SystemTime::now(), context, || {
+        check_request(deadline, cancelled).map_err(AcquireError::from)
+    })
+}
+
+fn parse_sessions(
+    output: &[u8],
+    inside_tmux: bool,
+    deadline: Instant,
+    cancelled: &AtomicBool,
+) -> Result<Vec<Session>, AcquireError> {
+    check_request(deadline, cancelled)?;
+    let text = std::str::from_utf8(output)
+        .map_err(|_| AcquireError::Invalid("invalid tmux metadata encoding".to_owned()))?;
+    check_request(deadline, cancelled)?;
+    if !text.is_empty() && !text.ends_with('\n') {
+        return Err(AcquireError::Invalid(
+            "malformed tmux metadata framing".to_owned(),
+        ));
+    }
+    let mut sessions = Vec::new();
+    for line in text.split_terminator('\n') {
+        check_request(deadline, cancelled)?;
+        let fields: Vec<_> = line.split('\t').collect();
+        if fields.len() != 6 {
             return Err(AcquireError::Invalid(
                 "malformed tmux metadata framing".to_owned(),
             ));
         }
-        let mut sessions = Vec::new();
-        for line in text.split_terminator('\n') {
-            let fields: Vec<_> = line.split('\t').collect();
-            if fields.len() != 6 {
-                return Err(AcquireError::Invalid(
-                    "malformed tmux metadata framing".to_owned(),
-                ));
-            }
-            let id = SessionId::parse(fields[0]).map_err(AcquireError::Invalid)?;
-            let created_at = (!fields[2].is_empty()
-                && fields[2].bytes().all(|b| b.is_ascii_digit()))
+        let id = SessionId::parse(fields[0]).map_err(AcquireError::Invalid)?;
+        let created_at = (!fields[2].is_empty() && fields[2].bytes().all(|b| b.is_ascii_digit()))
             .then(|| fields[2].parse::<u64>().ok())
             .flatten()
             .and_then(|seconds| SystemTime::UNIX_EPOCH.checked_add(Duration::from_secs(seconds)))
             .map(Field::Known)
             .unwrap_or_else(|| unavailable("uptime", "invalid session creation time"));
-            let current_window = match WindowId::parse(fields[3]) {
-                Ok(id) => Field::Known(CurrentWindow {
-                    id,
-                    width: positive_field(fields[4], "width"),
-                    height: positive_field(fields[5], "height"),
-                }),
-                Err(_) => unavailable("size", "invalid current-window identity"),
-            };
-            sessions
-                .try_reserve(1)
-                .map_err(|_| ProcessError::ResourceExhaustion)?;
-            sessions.push(Session {
+        let current_window = match WindowId::parse(fields[3]) {
+            Ok(id) => Field::Known(CurrentWindow {
                 id,
-                name: unavailable("name", "session name not retrieved"),
-                window_count: positive_field(fields[1], "windows"),
-                created_at,
-                current_window,
-                active: if socket.is_some() {
-                    unavailable(
-                        "active",
-                        "cannot reliably identify the invoking tmux client",
-                    )
-                } else {
-                    Field::Known(false)
-                },
-            });
-        }
-        sessions.sort_unstable_by(|left, right| left.id.cmp(&right.id));
-        if sessions.windows(2).any(|pair| pair[0].id == pair[1].id) {
-            return Err(AcquireError::Invalid(
-                "duplicate tmux session identity".to_owned(),
-            ));
-        }
-        Ok(sessions)
+                width: positive_field(fields[4], "width"),
+                height: positive_field(fields[5], "height"),
+            }),
+            Err(_) => unavailable("size", "invalid current-window identity"),
+        };
+        sessions
+            .try_reserve(1)
+            .map_err(|_| ProcessError::ResourceExhaustion)?;
+        sessions.push(Session {
+            id,
+            name: unavailable("name", "session name not retrieved"),
+            window_count: positive_field(fields[1], "windows"),
+            created_at,
+            current_window,
+            active: if inside_tmux {
+                unavailable(
+                    "active",
+                    "cannot reliably identify the invoking tmux client",
+                )
+            } else {
+                Field::Known(false)
+            },
+        });
     }
+    sessions.sort_unstable_by(|left, right| left.id.cmp(&right.id));
+    check_request(deadline, cancelled)?;
+    if sessions.windows(2).any(|pair| pair[0].id == pair[1].id) {
+        return Err(AcquireError::Invalid(
+            "duplicate tmux session identity".to_owned(),
+        ));
+    }
+    Ok(sessions)
 }
 
-fn parse_client_context(output: &[u8], tty: &OsStr) -> InvokingContext {
+fn parse_client_context(
+    output: &[u8],
+    tty: &OsStr,
+    deadline: Instant,
+    cancelled: &AtomicBool,
+) -> Result<InvokingContext, AcquireError> {
+    check_request(deadline, cancelled)?;
     let Some(lines) = output.strip_suffix(b"\n") else {
-        return InvokingContext::ActiveUnavailable;
+        return Ok(InvokingContext::ActiveUnavailable);
     };
     let mut matched = None;
     for line in lines.split(|byte| *byte == b'\n') {
+        check_request(deadline, cancelled)?;
         let Some(separator) = line.iter().position(|byte| *byte == b'\t') else {
-            return InvokingContext::ActiveUnavailable;
+            return Ok(InvokingContext::ActiveUnavailable);
         };
         let (client_tty, id) = line.split_at(separator);
         if client_tty != tty.as_bytes() {
             continue;
         }
         if matched.is_some() {
-            return InvokingContext::ActiveUnavailable;
+            return Ok(InvokingContext::ActiveUnavailable);
         }
         let Ok(id) = std::str::from_utf8(&id[1..]) else {
-            return InvokingContext::ActiveUnavailable;
+            return Ok(InvokingContext::ActiveUnavailable);
         };
         let Ok(id) = SessionId::parse(id) else {
-            return InvokingContext::ActiveUnavailable;
+            return Ok(InvokingContext::ActiveUnavailable);
         };
         matched = Some(id);
     }
-    match matched {
+    check_request(deadline, cancelled)?;
+    Ok(match matched {
         Some(session_id) => InvokingContext::InsideTmux { session_id },
         None => InvokingContext::ActiveUnavailable,
-    }
+    })
 }
 
 fn input_tty() -> Result<Option<OsString>, ProcessError> {
@@ -634,10 +708,86 @@ mod tests {
     use super::*;
 
     #[test]
+    fn parsing_and_snapshot_construction_reject_expired_or_cancelled_requests() {
+        let metadata = b"$1\t1\t0\t@1\t80\t24\n";
+        for (deadline, cancelled, expected_timeout) in [
+            (Instant::now() - Duration::from_secs(1), false, true),
+            (Instant::now() + Duration::from_secs(60), true, false),
+        ] {
+            let cancelled = AtomicBool::new(cancelled);
+            let parse = parse_sessions(metadata, false, deadline, &cancelled);
+            let snapshot = finish_snapshot(
+                Vec::new(),
+                InvokingContext::OutsideTmux,
+                deadline,
+                &cancelled,
+            );
+            let clients = parse_client_context(
+                b"/dev/pts/2\t$1\n",
+                OsStr::new("/dev/pts/2"),
+                deadline,
+                &cancelled,
+            );
+            for result in [parse.map(|_| ()), snapshot.map(|_| ()), clients.map(|_| ())] {
+                if expected_timeout {
+                    assert!(matches!(
+                        result,
+                        Err(AcquireError::Process(ProcessError::Timeout))
+                    ));
+                } else {
+                    assert!(matches!(
+                        result,
+                        Err(AcquireError::Process(ProcessError::Cancelled))
+                    ));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn snapshot_construction_checks_for_cancellation_during_processing() {
+        let cancelled = AtomicBool::new(false);
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let sessions = parse_sessions(
+            b"$1\t1\t0\t@1\t80\t24\n$2\t1\t0\t@2\t80\t24\n$3\t1\t0\t@3\t80\t24\n",
+            false,
+            deadline,
+            &cancelled,
+        )
+        .unwrap();
+        let mut checks = 0;
+        let result = SessionSnapshot::new_checked(
+            sessions,
+            SystemTime::now(),
+            InvokingContext::OutsideTmux,
+            || {
+                checks += 1;
+                if checks == 3 {
+                    cancelled.store(true, Ordering::SeqCst);
+                }
+                check_request(deadline, &cancelled).map_err(AcquireError::from)
+            },
+        );
+        assert!(matches!(
+            result,
+            Err(AcquireError::Process(ProcessError::Cancelled))
+        ));
+        assert_eq!(checks, 3);
+    }
+
+    #[test]
     fn client_identity_requires_one_exact_tty_match_with_valid_framing() {
         let tty = OsStr::new("/dev/pts/2");
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let cancelled = AtomicBool::new(false);
         assert_eq!(
-            parse_client_context(b"/dev/pts/20\t$9\n/dev/pts/2\t$3\n", tty),
+            parse_client_context(
+                b"/dev/pts/20\t$9\n/dev/pts/2\t$3\n",
+                tty,
+                deadline,
+                &cancelled
+            )
+            .unwrap(),
             InvokingContext::InsideTmux {
                 session_id: SessionId::parse("$3").unwrap(),
             }
@@ -651,7 +801,7 @@ mod tests {
             b"bad framing\n/dev/pts/2\t$3\n",
         ] {
             assert_eq!(
-                parse_client_context(output, tty),
+                parse_client_context(output, tty, deadline, &cancelled).unwrap(),
                 InvokingContext::ActiveUnavailable,
                 "{output:?}"
             );
