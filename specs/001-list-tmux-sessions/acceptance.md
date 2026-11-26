@@ -349,14 +349,43 @@ changes:
 - **T043–T044:** The help-contract failure was fixed and affected checks,
   performance trials, and all required local gates passed again on the
   identified implementation. Hosted enforcement remains separate.
-- **T045, T051, T055:** Default-branch (`master`) protection and `release`
-  environment settings are confirmed via read-only `gh api`, but `rulesets` is
-  empty, `spec_001_list_tmux_sessions` is unprotected, direct release creation
-  is not verified as blocked, and failed/unavailable check blocking across
-  every merge and release path has not been tested. Merge and release remain
-  blocked until hosted checks are verified across all paths.
-- **T046 and T053:** Completed in the final constitution review above; local
-  `tmux`-dependent CI checks remain required before merge.
+- **T045, T051, T055 (2026-11-25):**
+  - **PR & CI (`checks`):** PR `#1` (`Spec 001: List tmux sessions`,
+    `spec_001_list_tmux_sessions` → `master`, head SHA
+    `ff069f5e9f3795f475ad9a83ae346f97843d480d`) passed `Quality checks`
+    (`checks` job, run `45724655556`, `sh scripts/check-ci.sh` with `tmux`
+    installed) and reports `mergeStateStatus: CLEAN`. This closes the local
+    missing-`tmux` CI gap for this revision.
+  - **Protected paths & settings (verified via `gh api`):**
+    - `master` branch protection: requires strict `checks` status,
+      `enforce_admins: true`, `allow_force_pushes: false`,
+      `allow_deletions: false`.
+    - `spec_001_list_tmux_sessions`: short-lived feature branch to be deleted
+      after merging PR `#1` into `master` (no long-lived non-`master` target
+      branches).
+    - `release` Actions environment: `custom_branch_policies: true` with
+      custom tag policy `v*` (`id: 68293046`), `can_admins_bypass: false`
+      (used by `release-gate` in `.github/workflows/ci.yml`, which triggers on
+      `refs/tags/v*` pushes after `needs: checks`, verifies SemVer,
+      `Cargo.toml` version match, and `master` ancestry, and publishes
+      `.tar.gz` + `.sha256` via `gh release create --verify-tag
+      --generate-notes`).
+    - `release-tags` tag ruleset (`id: 28120706`): `target: tag`,
+      `include: ["refs/tags/v*"]`, `enforcement: active`, `rules: ["creation"]`,
+      `bypass_actors` restricted to Repository Admin (`actor_id: 5`).
+    - `release-tags-immutable` tag ruleset (`id: 28123900`): `target: tag`,
+      `include: ["~ALL"]`, `enforcement: active`, `rules: ["update",
+      "deletion"]`, `bypass_actors: []` (`current_user_can_bypass: never`).
+  - **Verification & host limitations:** `tests/quality_gates.rs` verifies
+    exact-staged commit checks, explicit local bypass, non-mutating formatting,
+    and CI script failure/unavailability locally. `Quality checks` previously
+    recorded a failed push run (`42716744468`). Live merge/release attempts
+    with a deliberately failing or missing check on PR `#1` were not
+    separately triggered; direct tag creation is blocked by `release-tags`,
+    while GitHub's UI/API release path without a new tag remains a platform
+    convention enforced by policy rather than a branch/environment rule.
+- **T046 and T053:** Completed in the final constitution review above; CI
+  `tmux`-dependent checks passed on PR `#1` (`45724655556`).
 
 No unverified hosted setting, cross-platform result, participant result or
 maintainer approval is claimed here.

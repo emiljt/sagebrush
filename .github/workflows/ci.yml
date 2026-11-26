@@ -3,7 +3,6 @@ name: Quality checks
 on:
   pull_request:
   push:
-  workflow_dispatch:
 
 permissions:
   contents: read
@@ -22,10 +21,56 @@ jobs:
         run: sh scripts/check-ci.sh
 
   release-gate:
-    if: github.event_name == 'workflow_dispatch'
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     needs: checks
     runs-on: ubuntu-latest
     environment: release
+    permissions:
+      contents: write
     steps:
-      - name: Confirm required checks passed
-        run: echo "Required checks passed; protected release environment reached."
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - name: Validate SemVer tag, Cargo.toml version, and master ancestry
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          SEMVER_RE='^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-((0|[1-9][0-9]*|[0-9]*[a-zA-Z-][0-9a-zA-Z-]*)(\.(0|[1-9][0-9]*|[0-9]*[a-zA-Z-][0-9a-zA-Z-]*))*))?$'
+          if ! printf '%s\n' "$TAG" | grep -Eq "$SEMVER_RE"; then
+            echo "Tag must be valid SemVer (e.g. v0.1.0 or v0.1.0-rc.1), got: $TAG" >&2
+            exit 1
+          fi
+          TAG_BASE="${TAG#v}"
+          TAG_BASE="${TAG_BASE%%-*}"
+          CRATE_VERSION="$(grep -m1 '^version = ' Cargo.toml | cut -d'"' -f2)"
+          if [ "$TAG_BASE" != "$CRATE_VERSION" ]; then
+            echo "Tag base version ($TAG_BASE) does not match Cargo.toml version ($CRATE_VERSION)" >&2
+            exit 1
+          fi
+          git fetch origin master
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/master; then
+            echo "Tagged commit $GITHUB_SHA is not an ancestor of origin/master" >&2
+            exit 1
+          fi
+      - name: Build release binary
+        run: cargo build --release --locked
+      - name: Package release archive and checksum
+        run: |
+          ARCHIVE="sagebrush-${GITHUB_REF_NAME}-x86_64-unknown-linux-gnu.tar.gz"
+          tar -C target/release -czf "$ARCHIVE" sagebrush
+          sha256sum "$ARCHIVE" > "${ARCHIVE}.sha256"
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          ARCHIVE="sagebrush-${TAG}-x86_64-unknown-linux-gnu.tar.gz"
+          PRERELEASE_FLAG=""
+          case "$TAG" in
+            *-*) PRERELEASE_FLAG="--prerelease" ;;
+          esac
+          gh release create "$TAG" \
+            --verify-tag \
+            --generate-notes \
+            $PRERELEASE_FLAG \
+            "$ARCHIVE" \
+            "${ARCHIVE}.sha256"

@@ -226,6 +226,13 @@ fn pull_request_and_release_workflow_depend_on_the_ci_checks() {
     );
     assert!(!checks.contains("continue-on-error: true"));
     assert!(release.lines().any(|line| line.trim() == "needs: checks"));
+    assert!(release.lines().any(|line| line.trim()
+        == "if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')"));
+    assert!(
+        release
+            .lines()
+            .any(|line| line.trim() == "environment: release")
+    );
     assert!(!release.contains("always()"));
     assert!(!release.contains("continue-on-error: true"));
 }
